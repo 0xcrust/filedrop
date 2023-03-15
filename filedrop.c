@@ -117,13 +117,7 @@ struct client_info *accept_connection(SOCKET server) {
         &incoming_address_len
     );
 
-    printf("accepted?\n");
-
-    /*
-    printf("set non-blocking:\n");
-    int flags;
-    flags = fcntl(new_socket, F_GETFL, 0);
-    fcntl(new_socket, F_SETFL, flags | O_NONBLOCK);*/
+    printf("-> new socket %d\n", new_socket);
 
     if (new_socket < 0) {
         fprintf(stderr, "Call to accept() failed: %s\n", strerror(errno));
@@ -147,6 +141,7 @@ struct client_info *accept_connection(SOCKET server) {
     printf("still here? doubtful\n");
 }
 
+// TODO: Cleaner way to handle multiple returns and function flow
 void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
     SSL *ssl_conn = SSL_new(ssl_context);
 
@@ -156,18 +151,54 @@ void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
     }
 
     SSL_set_fd(ssl_conn, ci->socket);
+    // Set non-blocking
+    int flags = fcntl(ci->socket, F_GETFL, 0);
+    fcntl(ci->socket, F_SETFL, flags | O_NONBLOCK);
 
-    if (SSL_accept(ssl_conn) <= 0) {
-        printf("ssl: ");
-        ERR_print_errors_fp(stderr);
-        printf("\n");
+    int ret = SSL_accept(ssl_conn);
+    printf("-> SSL_accept() => %d\n", ret);
+    // TODO: Do I need all these? Check how much time a valid ssl connection usually has
+    // to wait for
+    if (ret <= 0 ) { 
+        int ssl_error = SSL_get_error(ssl_conn, ret);
+        printf("-> SSL error: => %d\n", ssl_error);
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+            fd_set set;
+            FD_ZERO(&set);
+            FD_SET(ci->socket, &set);
 
-        SSL_shutdown(ssl_conn);
-        SSL_free(ssl_conn);
-        return;
+            struct timeval timeout;
+            timeout.tv_sec = 2;
+            timeout.tv_usec = 0;
+            select(ci->socket + 1, &set, 0, 0, &timeout);
+
+            //Try again
+            if (SSL_accept(ssl_conn) <= 0) {
+                fprintf(stderr, "Failed call to SSL_accept(): ");
+                ERR_print_errors_fp(stderr);
+                fprintf(stderr, "\n");
+
+                SSL_shutdown(ssl_conn);
+                SSL_free(ssl_conn);
+                return;
+            }
+        } else {
+            fprintf(stderr, "-> Failed call to SSL_accept(): ");
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "\n");
+
+            SSL_shutdown(ssl_conn);
+            SSL_free(ssl_conn);
+            return;
+        }
     }
 
+    // Set socket back to blocking
+    flags &= ~O_NONBLOCK;
+    fcntl(ci->socket, F_SETFL, flags);
+
     ci->ssl_connection = ssl_conn;
+    return;
 }
 
 void drop_client(struct client_info *client) {
@@ -245,7 +276,7 @@ int handle_upload(struct client_info *ci) {
     return bytes_received;
 }
 
-
+// TODO: Re-examine file permissions
 void setup_storage_dir(char *filename) {
     struct stat sb;
     if (stat(filename, &sb) == 0 && S_ISDIR(sb.st_mode))
