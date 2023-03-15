@@ -22,8 +22,15 @@ Features:
 *   Clear redundant printfs
 *   Write debug messages to a file
 *   Sort out certificates.
+*   Important!! Fix issues with dropped bytes during video transfer that prevents it from playing()
+//////// Issue with the above diagnosed. 5 bytes are being dropped at the beginning of the file.
+//////// Further diagnosis: try_make_ssl_connection is the cause of the problem.
+//////// A simple solution could just be to send the files separately
+*   Important!! Do research. It might turn out that we have to default to a normal connection for large uploads, rather than SSL
 */
 
+// TODO: This should be split into a `client` struct and a `upload` struct
+// A client should be able to have multiple simultaneous uploads
 struct client_info {
     int client_id;
     struct sockaddr_storage address;
@@ -68,8 +75,12 @@ struct client_info *get_client(SOCKET s) {
     struct client_info *client_info = active_clients;
     
     while(client_info) {
-        if (client_info->socket == s) 
+        if (client_info->socket == s) {
+            printf("Found socket %d in active_clients list\n", s);
+            printf("Location: %ld\n", (long) client_info);
             return client_info;
+        }
+            
             
         client_info = client_info->next;
     }
@@ -118,7 +129,7 @@ struct client_info *accept_connection(SOCKET server) {
         &incoming_address_len
     );
 
-    printf("-> new socket %d\n", new_socket);
+    printf("-> new socket: %d\n", new_socket);
 
     if (new_socket < 0) {
         fprintf(stderr, "Call to accept() failed: %s\n", strerror(errno));
@@ -142,27 +153,29 @@ struct client_info *accept_connection(SOCKET server) {
     printf("still here? doubtful\n");
 }
 
-void try_make_ssl_connect(SSL_CTX *ssl_context, struct client_info *ci) {
-    SSL *ssl_conn = SSL_new(ssl_context);
 
-    if (!ssl_conn) {
-        fprintf(stderr, "Failed creating new ssl connection %d", ci->client_id);
-        return; // Just return prematurely
-    }
-
-    SSL_set_fd(ssl_conn, ci->socket);
-
-    if (SSL_accept(ssl_conn) <= 0) {
-        printf("ssl: ");
-        ERR_print_errors_fp(stderr);
-        printf("\n");
-
-        SSL_shutdown(ssl_conn);
-        SSL_free(ssl_conn);
+void set_socket_non_blocking(int sock) {
+    int flags;
+    if ((flags = fcntl(sock, F_GETFL, 0)) < 0) {
+        fprintf(stderr, "Set_non_blocking. fcntl() call failed: (%s)\n", strerror(errno));
         return;
     }
+    if ((fcntl(sock, F_SETFL, flags | O_NONBLOCK)) < 0) {
+        fprintf(stderr, "Set_non_blocking. fcntl() call failed: (%s)\n", strerror(errno));
+        return;
+    }
+}
 
-    ci->ssl_connection = ssl_conn;
+void set_socket_blocking(int sock) {
+    int flags;
+    if ((flags = fcntl(sock, F_GETFL, 0)) < 0) {
+        fprintf(stderr, "Set_blocking. fcntl() call failed: (%s)\n", strerror(errno));
+        return;
+    }
+    if ((fcntl(sock, F_SETFL, flags ^ O_NONBLOCK)) < 0) {
+        fprintf(stderr, "Set_blocking. fcntl() call failed: (%s)\n", strerror(errno));
+        return;
+    }
 }
 
 // Tries to make an ssl_connection. Returns no value but its result can be 
@@ -176,16 +189,8 @@ void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
     }
 
     SSL_set_fd(ssl_conn, ci->socket);
-    // TODO: Check if this can error and handle it
-    int flags;
-    if ((flags = fcntl(ci->socket, F_GETFL, 0)) < 0) {
-        fprintf(stderr, "Get file status flag. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
-    }
-    if ((fcntl(ci->socket, F_SETFL, flags | O_NONBLOCK)) < 0) {
-        fprintf(stderr, "Set_non_blocking. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
-    }
+    set_socket_non_blocking(ci->socket);
+    
 
     fd_set reads;
     FD_ZERO(&reads);
@@ -194,34 +199,49 @@ void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
     fd_set writes;
     FD_ZERO(&writes);
     FD_SET(ci->socket, &writes);
-    int ret;
+    //int ret;
 
     struct timeval timeout;
-    timeout.tv_sec = 10;
+    timeout.tv_sec = 1;
     timeout.tv_usec = 0;
 
-    // TODO handle: It blocks in a normal connection. Big issue!
+    // TODO handle: It blocks in a normal connection. Big issue!(solved now!)
     while(!SSL_is_init_finished(ssl_conn)) {
-        ret = SSL_accept(ssl_conn);
+        int ret = SSL_accept(ssl_conn);
+        printf("SSL_accept read %d bytes\n", ret);
         fd_set write = writes;
         fd_set read = reads;
+        //int ret;
 
         switch (SSL_get_error(ssl_conn, ret)) {
             case SSL_ERROR_NONE:
+                printf("case ssl_error_none\n");
                 break;
 
             case SSL_ERROR_WANT_WRITE: 
+                printf("case ssl_error_want_write\n");
                 fd_set write = writes;
-                if (select(ci->socket + 1, 0, &writes, 0, &timeout) < 0) {
+                if ((ret = select(ci->socket + 1, 0, &writes, 0, &timeout)) < 0) {
                     fprintf(stderr, "select() call failed: (%s)\n", strerror(errno));
                 }
+                if (ret == 0) {
+                    set_socket_blocking(ci->socket);
+                    return;
+                }
+                //if (ret == 0) return; // select() timed out
                 break;
 
             case SSL_ERROR_WANT_READ: 
+                printf("case ssl_error_want_read\n");
                 fd_set read = reads;
-                if (select(ci->socket+1, &reads, 0, 0, &timeout) < 0) {
+                if ((ret = select(ci->socket+1, &reads, 0, 0, &timeout)) < 0) {
                     fprintf(stderr, "select() call failed: (%s)\n", strerror(errno));
                 }
+                if (ret == 0) {
+                    set_socket_blocking(ci->socket);
+                    return;
+                }
+                //if (select_ret == 0) return; // select() timed out
                 break;
 
             default:
@@ -231,17 +251,11 @@ void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
 
                 SSL_shutdown(ssl_conn);
                 SSL_free(ssl_conn);
+                set_socket_blocking(ci->socket);
                 return;
         }
     }
-
-    // Set socket back to blocking
-    flags &= ~O_NONBLOCK;
-    if (fcntl(ci->socket, F_SETFL, flags) < 0) {
-        fprintf(stderr, "Set_blocking. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
-    }
-
+    set_socket_blocking(ci->socket);
     ci->ssl_connection = ssl_conn;
     return;
 }
@@ -258,65 +272,98 @@ void drop_client(struct client_info *client) {
         SSL_free(client->ssl_connection);
     }
 
+    printf("closing socket %d\n", client->socket);
     close(client->socket);
-    fclose(client->dest_file);
+    if (client->dest_file) fclose(client->dest_file);
 
-    struct client_info **p = &client_pointer;
+    struct client_info **p = &client;
     *p = client->next;
+    if (client_pointer == active_clients) {
+        active_clients = client_pointer->next;
+    }
+    free(client_pointer);
 
-    free(client);
     return;
 }
 
-int handle_upload(struct client_info *ci) {
+// TODO: On upload done, send EOF / shutdown to connection
+// Use enums to manage state machines?
+int handle_upload(struct client_info *ci, char* filename) { // TODO: Let filename be decided inside
+// this function, not outside it
+    printf("Continuing upload...\n");
     SSL *ssl = ci->ssl_connection;
-
-    int bytes_received;
-    if (ci->ssl_connection) {
-        bytes_received = SSL_read(
-            ssl, 
-            ci->upload_buffer, 
-            sizeof(ci->upload_buffer) //TODO: Consider making it sizeof(ci->upload_buffer) + 1
-        );
-    } else {
-        bytes_received = recv(
-            ci->socket,
-            ci->upload_buffer,
-            sizeof(ci->upload_buffer), 0 
-        );
-    }
-
-    if (bytes_received < 1) {
-        return -1;
-    }
-
-    printf("Received %d bytes from %s\n", bytes_received, ci->address_p);
-    //ci->upload_buffer[bytes_received + 1] = 0; // TODO: uncomment this?
 
     if (!ci->dest_file) { // if file is uninitialized
         time_t time_var;
         time(&time_var);
 
-        char filename[100];
-        sprintf(filename, "%d_%s", ci->client_id, ctime(&time_var));
+        // TODO: Decide on a good naming convention for files
+        // Also decide on how to properly arrange different uploads
+        // for different users.
+
+        //char filename[100];
+        //char *filename = "tests/test.c";
+        //sprintf(filename, "%d_%s", ci->client_id, ctime(&time_var));
+        printf("-> Creating file with name {%s}.\n", filename);
         
         FILE *new_file = fopen(filename, "w");
         if (!new_file) {
-            fprintf(stderr, "Failed creating file");
+            fprintf(stderr, "Failed creating file.\n");
             return -1;
         }
         ci->dest_file = new_file;
     }
 
-    // Read from buffer to file
+    int bytes_received;
+    // TODO: Call recursively?
+    // TODO: IMPORTANT WHEN WAKE UP: IMPROVE DEBUGGING BY SEPARATING
+    // ERROR PRINTING FOR BOTH CONDITIONS AND USING STRERROR
+    if (ci->ssl_connection) {
+        bytes_received = SSL_read(
+            ssl, 
+            ci->upload_buffer, 
+            sizeof(ci->upload_buffer)//TODO: Consider making it sizeof(ci->upload_buffer) - 1
+        );
+        if (bytes_received < 1) {
+            fprintf(stderr, "-> SSL_read() failed: ");
+            ERR_print_errors_fp(stderr);
+            fprintf(stderr, "\n");
+            return -1;
+        }
+    } 
+    if (!ci->ssl_connection) {
+        bytes_received = recv(
+            ci->socket,
+            ci->upload_buffer,
+            sizeof(ci->upload_buffer), 0 
+        );
+        if (bytes_received < 1) {
+            fprintf(stderr, "-> recv() failed: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+
+    // TODO: Split handling of a failure from handling of a completed upload.
+    // Don't return -1 for both
+
+    printf("Received %d bytes from %s\n", bytes_received, ci->address_p);
+    printf("Received: \n%.*s\n from stream", bytes_received, ci->upload_buffer);
+    printf("Writing %d bytes to file.\n", bytes_received);
+    ci->bytes_uploaded+=bytes_received;
+
+    char last = ci->upload_buffer[sizeof(ci->upload_buffer) - 1];
+    printf("possible EOF char: %c\n", last);
+
     int remaining = bytes_received;
     while(remaining > 0) {
         int bytes_written = fwrite(ci->upload_buffer, 1, bytes_received, ci->dest_file);
+        printf("Wrote: \n%.*s\n to file", bytes_written, ci->upload_buffer);
         if (fwrite < 0) {
             return -1;
         }
         remaining-=bytes_written;
     }
+    fflush(ci->dest_file);
 
     return bytes_received;
 }
@@ -404,6 +451,7 @@ int main(int argc, char *argv[]) {
 
         for (int i = 1; i <= max_socket; ++i) {
             if (FD_ISSET(i, &reads)) {
+                printf("Selected socket %d\n", i);
                 if (i == server) {
                     printf("-> New incoming connection.\n");
                     struct client_info *new_client = accept_connection((SOCKET) i);
@@ -414,6 +462,7 @@ int main(int argc, char *argv[]) {
                         continue; 
                     }
                     printf("-> New connection made from %s\n", new_client->address_p);
+                    FD_SET(new_client->socket, &reads);
                     if (new_client->socket > max_socket)
                     {
                         max_socket = new_client->socket;
@@ -430,11 +479,19 @@ int main(int argc, char *argv[]) {
                 } else {
                     printf("-> Reading from established connection\n");
                     struct client_info *client = get_client(i);
-                    int bytes_uploaded = handle_upload(client);
-                    if (bytes_uploaded < 0) {
-                        printf("->Error with client %s. Dropping...\n", client->address_p);
-                        drop_client(client);
+                    int bytes_uploaded = handle_upload(client, argv[2]);
+                    printf("handle___upload() return value: %d\n", bytes_uploaded);
+
+                    // TODO: Distinguish from error and file upload completion
+                    if (bytes_uploaded < 0) { //TODO: also handle if bytes_uploaded < sizeof(client->upload_buffer)
+                        // (contd:) This would also mean that the read is complete
+                        // TODO: Fix! Not every termination is due to an error.
+                        printf("-> Client %s got an error. Dropping.. \n", client->address_p);
+                        printf("-> Uploaded %d bytes in total\n", client->bytes_uploaded);
+                        drop_client(client); //TODO: no longer being triggered for some reason
                         FD_CLR(i, &master);
+                    } else { // so we can read again
+                        FD_SET(i, &master);
                     }
                 }
             } 
