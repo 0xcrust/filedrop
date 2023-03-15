@@ -21,6 +21,7 @@ Features:
 *   Check function return types
 *   Clear redundant printfs
 *   Write debug messages to a file
+*   Sort out certificates.
 */
 
 struct client_info {
@@ -141,8 +142,7 @@ struct client_info *accept_connection(SOCKET server) {
     printf("still here? doubtful\n");
 }
 
-// TODO: Cleaner way to handle multiple returns and function flow
-void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
+void try_make_ssl_connect(SSL_CTX *ssl_context, struct client_info *ci) {
     SSL *ssl_conn = SSL_new(ssl_context);
 
     if (!ssl_conn) {
@@ -151,51 +151,96 @@ void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
     }
 
     SSL_set_fd(ssl_conn, ci->socket);
-    // Set non-blocking
-    int flags = fcntl(ci->socket, F_GETFL, 0);
-    fcntl(ci->socket, F_SETFL, flags | O_NONBLOCK);
 
-    int ret = SSL_accept(ssl_conn);
-    printf("-> SSL_accept() => %d\n", ret);
-    // TODO: Do I need all these? Check how much time a valid ssl connection usually has
-    // to wait for
-    if (ret <= 0 ) { 
-        int ssl_error = SSL_get_error(ssl_conn, ret);
-        printf("-> SSL error: => %d\n", ssl_error);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
-            fd_set set;
-            FD_ZERO(&set);
-            FD_SET(ci->socket, &set);
+    if (SSL_accept(ssl_conn) <= 0) {
+        printf("ssl: ");
+        ERR_print_errors_fp(stderr);
+        printf("\n");
 
-            struct timeval timeout;
-            timeout.tv_sec = 2;
-            timeout.tv_usec = 0;
-            select(ci->socket + 1, &set, 0, 0, &timeout);
+        SSL_shutdown(ssl_conn);
+        SSL_free(ssl_conn);
+        return;
+    }
 
-            //Try again
-            if (SSL_accept(ssl_conn) <= 0) {
-                fprintf(stderr, "Failed call to SSL_accept(): ");
+    ci->ssl_connection = ssl_conn;
+}
+
+// Tries to make an ssl_connection. Returns no value but its result can be 
+// validated by checking for `ci->ssl_connection`
+void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
+    SSL *ssl_conn = SSL_new(ssl_context);
+
+    if (!ssl_conn) {
+        fprintf(stderr, "Failed creating new ssl connection %d", ci->client_id);
+        return;
+    }
+
+    SSL_set_fd(ssl_conn, ci->socket);
+    // TODO: Check if this can error and handle it
+    int flags;
+    if ((flags = fcntl(ci->socket, F_GETFL, 0)) < 0) {
+        fprintf(stderr, "Get file status flag. fcntl() call failed: (%s)\n", strerror(errno));
+        return;
+    }
+    if ((fcntl(ci->socket, F_SETFL, flags | O_NONBLOCK)) < 0) {
+        fprintf(stderr, "Set_non_blocking. fcntl() call failed: (%s)\n", strerror(errno));
+        return;
+    }
+
+    fd_set reads;
+    FD_ZERO(&reads);
+    FD_SET(ci->socket, &reads);
+
+    fd_set writes;
+    FD_ZERO(&writes);
+    FD_SET(ci->socket, &writes);
+    int ret;
+
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+
+    // TODO handle: It blocks in a normal connection. Big issue!
+    while(!SSL_is_init_finished(ssl_conn)) {
+        ret = SSL_accept(ssl_conn);
+        fd_set write = writes;
+        fd_set read = reads;
+
+        switch (SSL_get_error(ssl_conn, ret)) {
+            case SSL_ERROR_NONE:
+                break;
+
+            case SSL_ERROR_WANT_WRITE: 
+                fd_set write = writes;
+                if (select(ci->socket + 1, 0, &writes, 0, &timeout) < 0) {
+                    fprintf(stderr, "select() call failed: (%s)\n", strerror(errno));
+                }
+                break;
+
+            case SSL_ERROR_WANT_READ: 
+                fd_set read = reads;
+                if (select(ci->socket+1, &reads, 0, 0, &timeout) < 0) {
+                    fprintf(stderr, "select() call failed: (%s)\n", strerror(errno));
+                }
+                break;
+
+            default:
+                fprintf(stderr, "Unexpected. SSL_accept() handshake failed: ");
                 ERR_print_errors_fp(stderr);
                 fprintf(stderr, "\n");
 
                 SSL_shutdown(ssl_conn);
                 SSL_free(ssl_conn);
                 return;
-            }
-        } else {
-            fprintf(stderr, "-> Failed call to SSL_accept(): ");
-            ERR_print_errors_fp(stderr);
-            fprintf(stderr, "\n");
-
-            SSL_shutdown(ssl_conn);
-            SSL_free(ssl_conn);
-            return;
         }
     }
 
     // Set socket back to blocking
     flags &= ~O_NONBLOCK;
-    fcntl(ci->socket, F_SETFL, flags);
+    if (fcntl(ci->socket, F_SETFL, flags) < 0) {
+        fprintf(stderr, "Set_blocking. fcntl() call failed: (%s)\n", strerror(errno));
+        return;
+    }
 
     ci->ssl_connection = ssl_conn;
     return;
@@ -387,7 +432,7 @@ int main(int argc, char *argv[]) {
                     struct client_info *client = get_client(i);
                     int bytes_uploaded = handle_upload(client);
                     if (bytes_uploaded < 0) {
-                        printf("->Disconnected from %s\n", client->address_p);
+                        printf("->Error with client %s. Dropping...\n", client->address_p);
                         drop_client(client);
                         FD_CLR(i, &master);
                     }
