@@ -1,0 +1,1 @@
+gcc filedrop.c -o filedrop -lssl -lcrypto #&& ./filedrop
