@@ -11,40 +11,59 @@ Features:
 
 /* TODO:
 *   Handle errors properly. Some should fail and exit, some shouldn't.
-*   Check client_info and remove redundant fields if any.
+*   Check connection_info and remove redundant fields if any.
 *   Find a way to get the file format or desired filename from the user.
 *   Allow user to upload multiple files in one connection.
 *   Create a unique folder for each user
 *   Add proper commenting and some measure of documentation.
 *   Write function prototypes in filedrop.h and move functions below
-*   Make cross-platform
 *   Check function return types
 *   Clear redundant printfs
 *   Write debug messages to a file
 *   Sort out certificates.
-*   Important!! Fix issues with dropped bytes during video transfer that prevents it from playing()
-//////// Issue with the above diagnosed. 5 bytes are being dropped at the beginning of the file.
-//////// Further diagnosis: try_make_ssl_connection is the cause of the problem.
-//////// A simple solution could just be to send the files separately
-*   Important!! Do research. It might turn out that we have to default to a normal connection for large uploads, rather than SSL
+*   Factor in FD_CLR to dropping a client
 */
+
+// To list the contents of a directory: 
+// https://stackoverflow.com/questions/4204666/how-to-list-files-in-a-directory-in-a-c-program
 
 // TODO: This should be split into a `client` struct and a `upload` struct
 // A client should be able to have multiple simultaneous uploads
-struct client_info {
-    int client_id;
+struct connection {
+    int state;
     struct sockaddr_storage address;
     socklen_t address_length;
     char address_p[NAME_LENGTH];
     int socket;
-    char upload_buffer[BUFFERSIZE];
-    int bytes_uploaded;
-    SSL *ssl_connection;
-    FILE *dest_file;
-    struct client_info *next;
+    int action;
+    char f_buf[BUFFERSIZE];
+    char f_name[F_NAME_LENGTH]; // string
+    int bytes_transferred;
+    SSL *ssl_conn;
+    FILE *target_file;
+    char next_msg[1024];
+    struct connection *next;
 };
 
-static struct client_info *active_clients = 0;
+
+static struct connection *active_connections = 0;
+
+enum { upload, download };
+
+// TODO!!!: Go back to normal way of serving uploads. At least for now
+/*
+enum {
+    st_start, st_ssl_init_active, st_sent_action_prompt, st_rcvd_action_response,
+    st_sent_fname_req, st_rcvd_filename, st_dl_active, st_ul_active,
+    st_err, st_success
+};*/
+
+enum {
+    send_action_prompt, ssl_handshake_in_progress, receive_action, send_fname_prompt,
+    receive_fname, initiate_action, download_in_progress, upload_in_progress,
+    error_state, action_success
+};
+
 
 // Initialize OpenSSL and setup context for managing connections
 void ssl_initialize(SSL_CTX** ssl_context) {
@@ -71,55 +90,24 @@ void ssl_initialize(SSL_CTX** ssl_context) {
 }
 
 // Find the client_info for a particular socket s
-struct client_info *get_client(SOCKET s) {
-    struct client_info *client_info = active_clients;
+struct connection *get_connection_info(SOCKET s) {
+    struct connection *conn = active_connections;
     
-    while(client_info) {
-        if (client_info->socket == s) {
+    while(conn) {
+        if (conn->socket == s) {
             printf("Found socket %d in active_clients list\n", s);
-            printf("Location: %ld\n", (long) client_info);
-            return client_info;
+            printf("Location: %ld\n", (long) conn);
+            return conn;
         }
-            
-            
-        client_info = client_info->next;
+        conn = conn->next;
     }
 
     return 0;
 }
 
-// Create a new client and add to global list of active clients
-struct client_info *create_new_client(SOCKET s) {
-    if (get_client(s) != 0) {
-        fprintf(stderr, "Socket in use by existing client\n");
-        return 0; 
-    }
-
-    struct client_info *new = (struct client_info*) calloc(1, sizeof(struct client_info));
-    if (!new) {
-        fprintf(stderr, "Failed allocating memory for new client_info struct\n");
-        return 0;
-    }
-
-    new->client_id = active_clients ? active_clients->client_id + 1 : 0;
-    new->address_length = sizeof(new->address);
-    new->next = active_clients;
-    new->socket = s;
-    active_clients = new;
-    return new;
-}
-
-// Obtain a client's presentation address and write it to its struct
-void set_presentation_address(struct client_info *client) {
-    getnameinfo(
-        (struct sockaddr*) &client->address, client->address_length,
-        client->address_p, NAME_LENGTH, 0, 0,
-        NI_NUMERICHOST
-    );
-    return;
-}
-
-struct client_info *accept_connection(SOCKET server) {
+// TODO: Change API to return a number to represent error status and
+// take in a pointer to the new connection instead
+int *accept_connection(SOCKET server, struct connection *new_conn) {
     struct sockaddr_storage incoming_address;
     socklen_t incoming_address_len = sizeof(incoming_address);
 
@@ -133,211 +121,294 @@ struct client_info *accept_connection(SOCKET server) {
 
     if (new_socket < 0) {
         fprintf(stderr, "Call to accept() failed: %s\n", strerror(errno));
-        return 0;
+        return -1;
+    }
+    // TODO: Is this redundant?
+    if (get_connection_info(new_socket) != 0) {
+        fprintf(stderr, "Socket in use by existing client\n");
+        return -1; 
     }
 
-    struct client_info *new_client = create_new_client(new_socket);
-    printf("new_client: %ld\n", (long) new_client);
-    if (!new_client) {
-        fprintf(stderr, "create_new_client() failed\n");
-        return 0;
+    new_conn = (struct connection*) calloc(1, sizeof(struct connection));
+    if (!new_conn) {
+        fprintf(stderr, "Failed allocating memory for new client_info struct\n");
+        return -1;
     }
     printf("new client created?\n");
 
-    new_client->address = incoming_address;
-    new_client->address_length = incoming_address_len;
-    set_presentation_address(new_client);
-    printf("values set. returning...\n");
+    new_conn->state = send_action_prompt;
+    new_conn->address = incoming_address;
+    new_conn->address_length = incoming_address_len;
+    new_conn->bytes_transferred = 0;
+    // TODO: Handle possible errors
+    getnameinfo(
+        (struct sockaddr*) &new_conn->address, new_conn->address_length,
+        new_conn->address_p, sizeof(new_conn->address_p), 0, 0,
+        NI_NUMERICHOST
+    );
+    new_conn->address_length = sizeof(new_conn->address);
+    new_conn->next = active_connections;
+    new_conn->socket = new_socket;
+    active_connections = new_conn;
 
-    return new_client;
-    printf("still here? doubtful\n");
+    return 0;
 }
 
-
-void set_socket_non_blocking(int sock) {
+// TODO: Move back into try_make_ssl_connection()-> Maybe not
+int set_socket_non_blocking(int sock) {
     int flags;
     if ((flags = fcntl(sock, F_GETFL, 0)) < 0) {
         fprintf(stderr, "Set_non_blocking. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
+        return -1;
     }
     if ((fcntl(sock, F_SETFL, flags | O_NONBLOCK)) < 0) {
         fprintf(stderr, "Set_non_blocking. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
+        return -1;
     }
+    return 0;
 }
 
-void set_socket_blocking(int sock) {
+// TODO: Move back into try_make_ssl_connection() -> Maybe not
+int set_socket_blocking(int sock) {
     int flags;
     if ((flags = fcntl(sock, F_GETFL, 0)) < 0) {
         fprintf(stderr, "Set_blocking. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
+        return -1;
     }
     if ((fcntl(sock, F_SETFL, flags ^ O_NONBLOCK)) < 0) {
         fprintf(stderr, "Set_blocking. fcntl() call failed: (%s)\n", strerror(errno));
-        return;
+        return -1;
     }
+    return 0;
 }
 
-// Tries to make an ssl_connection. Returns no value but its result can be 
-// validated by checking for `ci->ssl_connection`
-void try_make_ssl_connection(SSL_CTX *ssl_context, struct client_info *ci) {
+int init_ssl_connection(SSL_CTX *ssl_context, struct connection* conn) {
     SSL *ssl_conn = SSL_new(ssl_context);
 
     if (!ssl_conn) {
-        fprintf(stderr, "Failed creating new ssl connection %d", ci->client_id);
-        return;
+        fprintf(stderr, "Failed creating new ssl connection");
+        return -1;
     }
 
-    SSL_set_fd(ssl_conn, ci->socket);
-    set_socket_non_blocking(ci->socket);
-    
+    SSL_set_fd(ssl_conn, conn->socket);
+    return (set_socket_non_blocking(conn->socket));
+}
 
-    fd_set reads;
-    FD_ZERO(&reads);
-    FD_SET(ci->socket, &reads);
+int handle_ssl_connection(SSL_CTX *ssl_context, struct connection *conn) {
+    int result = SSL_accept(conn->ssl_conn);
+    printf("SSL_accept() read %d bytes\n", result);
+
+    // TODO: Use another select call to block on a read here for a particular timeout?
+    // The function takes in an argument that tells us whether we're reading
+    // or writing
 
     fd_set writes;
-    FD_ZERO(&writes);
-    FD_SET(ci->socket, &writes);
-    //int ret;
+    fd_set reads;
 
+    // experiment with reducing this value
     struct timeval timeout;
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
+    // TODO: Toggle reads_m and writes_m to include or exclude the fd based
+    // on whether SSL wants a read or write?
 
-    // TODO handle: It blocks in a normal connection. Big issue!(solved now!)
-    while(!SSL_is_init_finished(ssl_conn)) {
-        int ret = SSL_accept(ssl_conn);
-        printf("SSL_accept read %d bytes\n", ret);
-        fd_set write = writes;
-        fd_set read = reads;
-        //int ret;
-
-        switch (SSL_get_error(ssl_conn, ret)) {
+    // Ideally shouldn't block since the outer select signalled that it can
+    // already read or write
+    int status = -1;
+    while(1) {
+        FD_ZERO(&writes);
+        FD_ZERO(&reads);
+        
+        switch(SSL_get_error(conn->ssl_conn, result)) {
             case SSL_ERROR_NONE:
-                printf("case ssl_error_none\n");
+                status = 0;
                 break;
-
-            case SSL_ERROR_WANT_WRITE: 
-                printf("case ssl_error_want_write\n");
-                fd_set write = writes;
-                if ((ret = select(ci->socket + 1, 0, &writes, 0, &timeout)) < 0) {
-                    fprintf(stderr, "select() call failed: (%s)\n", strerror(errno));
-                }
-                if (ret == 0) {
-                    set_socket_blocking(ci->socket);
-                    return;
-                }
-                //if (ret == 0) return; // select() timed out
+            case SSL_ERROR_WANT_WRITE:
+                status = 1;
+                FD_SET(conn->socket, &writes);
                 break;
-
-            case SSL_ERROR_WANT_READ: 
-                printf("case ssl_error_want_read\n");
-                fd_set read = reads;
-                if ((ret = select(ci->socket+1, &reads, 0, 0, &timeout)) < 0) {
-                    fprintf(stderr, "select() call failed: (%s)\n", strerror(errno));
-                }
-                if (ret == 0) {
-                    set_socket_blocking(ci->socket);
-                    return;
-                }
-                //if (select_ret == 0) return; // select() timed out
+            case SSL_ERROR_WANT_READ:
+                status = 1;
+                FD_SET(conn->socket, &reads);
                 break;
-
             default:
-                fprintf(stderr, "Unexpected. SSL_accept() handshake failed: ");
-                ERR_print_errors_fp(stderr);
-                fprintf(stderr, "\n");
+                status = -1;
+                break;
+        }
 
-                SSL_shutdown(ssl_conn);
-                SSL_free(ssl_conn);
-                set_socket_blocking(ci->socket);
-                return;
+        if (status < 1) break;
+
+        if (select(conn->socket + 1, &reads, &writes, 0, &timeout) < 0) {
+            fprintf(stderr, "handle_ssl_connection: Select() failed\n");
+            status = -1;
+            break;
         }
     }
-    set_socket_blocking(ci->socket);
-    ci->ssl_connection = ssl_conn;
-    return;
+
+    return status;
 }
 
-void drop_client(struct client_info *client) {
-    struct client_info *client_pointer = get_client(client->socket);
-    if (client_pointer == 0) {
-        fprintf(stderr, "Client info does not exist for socket %d.\n", client->socket);
+void drop_connection(struct connection *conn) {
+    struct connection *cp = get_connection_info(conn->socket);
+    if (cp == 0) {
+        fprintf(stderr, "Client info does not exist for socket %d.\n", conn->socket);
         return;
     }
 
-    if (client->ssl_connection) {
-        SSL_shutdown(client->ssl_connection);
-        SSL_free(client->ssl_connection);
+    if (conn->ssl_conn) {
+        SSL_shutdown(conn->ssl_conn);
+        SSL_free(conn->ssl_conn);
     }
 
-    printf("closing socket %d\n", client->socket);
-    close(client->socket);
-    if (client->dest_file) fclose(client->dest_file);
+    printf("closing socket %d\n", conn->socket);
+    close(conn->socket);
+    if (conn->target_file) fclose(conn->target_file);
 
-    struct client_info **p = &client;
-    *p = client->next;
-    if (client_pointer == active_clients) {
-        active_clients = client_pointer->next;
+    struct connection **p = &conn;
+    *p = conn->next;
+    if (cp == active_connections) {
+        active_connections = cp->next;
     }
-    free(client_pointer);
+    free(cp);
 
     return;
 }
 
+int send_to_client(struct connection *conn, char *buf, int buf_size) {
+    int bytes_sent;
+
+    if(conn->ssl_conn) {
+        bytes_sent = SSL_write(conn->ssl_conn, buf, buf_size);
+    } else {
+        bytes_sent = send(conn->socket, buf, buf_size, 0);
+    }
+
+    return bytes_sent;
+}
+
+int rec_send_to_client(struct connection *conn, char *buf, int buf_size) {
+    int bytes_to_send = buf_size;
+    int total_bytes_sent = 0;
+
+    while(total_bytes_sent < bytes_to_send) {
+        int bytes_sent;
+        if ((bytes_sent = send_to_client(
+            conn, (buf + total_bytes_sent), 
+            (bytes_to_send - total_bytes_sent))) <= 0
+        ) { 
+            return -1; 
+        } 
+
+        total_bytes_sent += bytes_sent;
+    }
+
+    return total_bytes_sent;
+}
+
+int recv_from_client(struct connection *conn, char *buf, int buf_size) {
+    int bytes_received;
+
+    if(conn->ssl_conn) {
+        bytes_received = SSL_write(conn->ssl_conn, buf, buf_size);
+    } else {
+        bytes_received = send(conn->socket, buf, buf_size, 0);
+    }
+
+    return bytes_received;
+}
+
+int rec_recv_from_client(struct connection *conn, char *buf, int buf_size, int *bytes_received) {
+    int total_bytes_read = 0;
+
+    while(1) {
+        int bytes_read;
+        if ((bytes_read = simple_recv(conn, buf + bytes_read, buf_size - bytes_read)) <= 0) {
+            return bytes_read;
+        } 
+        *bytes_received+=bytes_read;
+    }
+
+    return 1; // For success
+}
+
+int handle_download(struct connection *conn, char *storage_dirname) {
+    if (!conn->target_file) {
+        char filepath[strlen(storage_dirname) + strlen(conn->f_name) + 1];
+        snprintf(
+            filepath, sizeof(filepath), "%s/%s", 
+            storage_dirname, conn->f_name
+        );
+        printf("-> Opening file with name {%s}.\n", filepath);
+
+        FILE *new_file = fopen(filepath, "w");
+        if (!new_file) {
+            fprintf(stderr, "Failed opening file.\n");
+            return -1;
+        }
+        conn->target_file = new_file;
+    }
+
+    int bytes_read;
+    if ((bytes_read = fread(conn->f_buf, 1, sizeof(conn->f_buf), conn->target_file)) <= 0) {
+        if (feof(conn->target_file) != 0) {
+            // File has finished sending
+            return 0;
+        } else {
+            return -1;
+        }
+    }
+    //fflush(conn->target_file);
+    int result;
+    if ((result = rec_send_to_client(conn, conn->f_buf, bytes_read)) > 0) 
+    {
+        conn->bytes_transferred+= result;
+    }
+
+    return result;
+}
+
 // TODO: On upload done, send EOF / shutdown to connection
-// Use enums to manage state machines?
-int handle_upload(struct client_info *ci, char* filename) { // TODO: Let filename be decided inside
-// this function, not outside it
+// TODO: What to do here? Should it try to complete the upload by calling recursively
+// or should it read what it can and move on
+int handle_upload(struct connection *conn, char *storage_dirname) { 
     printf("Continuing upload...\n");
-    SSL *ssl = ci->ssl_connection;
-
-    if (!ci->dest_file) { // if file is uninitialized
-        time_t time_var;
-        time(&time_var);
-
-        // TODO: Decide on a good naming convention for files
-        // Also decide on how to properly arrange different uploads
-        // for different users.
-
-        //char filename[100];
-        //char *filename = "tests/test.c";
-        //sprintf(filename, "%d_%s", ci->client_id, ctime(&time_var));
-        printf("-> Creating file with name {%s}.\n", filename);
+    if (!conn->target_file) { 
+        char filepath[strlen(storage_dirname) + strlen(conn->f_name) + 1];
+        snprintf(
+            filepath, "%s/%s", 
+            storage_dirname, conn->f_name
+        );
         
-        FILE *new_file = fopen(filename, "w");
+        printf("-> Creating file with name {%.*s}.\n", sizeof(filepath), filepath);
+        FILE *new_file = fopen(filepath, "w");
         if (!new_file) {
             fprintf(stderr, "Failed creating file.\n");
             return -1;
         }
-        ci->dest_file = new_file;
+        conn->target_file = new_file;
     }
 
+    // TODO: Refactor this to use the read_from_client function
     int bytes_received;
-    // TODO: Call recursively?
-    // TODO: IMPORTANT WHEN WAKE UP: IMPROVE DEBUGGING BY SEPARATING
-    // ERROR PRINTING FOR BOTH CONDITIONS AND USING STRERROR
-    if (ci->ssl_connection) {
+    if (conn->ssl_conn) {
         bytes_received = SSL_read(
-            ssl, 
-            ci->upload_buffer, 
-            sizeof(ci->upload_buffer)//TODO: Consider making it sizeof(ci->upload_buffer) - 1
+            conn->ssl_conn, 
+            conn->f_buf, 
+            sizeof(conn->f_buf)
         );
-        if (bytes_received < 1) {
+        if (bytes_received == -1) {
             fprintf(stderr, "-> SSL_read() failed: ");
             ERR_print_errors_fp(stderr);
             fprintf(stderr, "\n");
             return -1;
         }
-    } 
-    if (!ci->ssl_connection) {
+    } else {
         bytes_received = recv(
-            ci->socket,
-            ci->upload_buffer,
-            sizeof(ci->upload_buffer), 0 
+            conn->socket,
+            conn->f_buf,
+            sizeof(conn->f_buf), 0 
         );
-        if (bytes_received < 1) {
+        if (bytes_received == -1) {
             fprintf(stderr, "-> recv() failed: %s\n", strerror(errno));
             return -1;
         }
@@ -346,55 +417,69 @@ int handle_upload(struct client_info *ci, char* filename) { // TODO: Let filenam
     // TODO: Split handling of a failure from handling of a completed upload.
     // Don't return -1 for both
 
-    printf("Received %d bytes from %s\n", bytes_received, ci->address_p);
-    printf("Received: \n%.*s\n from stream", bytes_received, ci->upload_buffer);
+    printf("Received %d bytes from %s\n", bytes_received, conn->address_p);
+    printf("Received: \n%.*s\n from stream", bytes_received, conn->f_buf);
     printf("Writing %d bytes to file.\n", bytes_received);
-    ci->bytes_uploaded+=bytes_received;
 
-    char last = ci->upload_buffer[sizeof(ci->upload_buffer) - 1];
+    char last = conn->f_buf[sizeof(conn->f_buf) - 1];
     printf("possible EOF char: %c\n", last);
 
     int remaining = bytes_received;
     while(remaining > 0) {
-        int bytes_written = fwrite(ci->upload_buffer, 1, bytes_received, ci->dest_file);
-        printf("Wrote: \n%.*s\n to file", bytes_written, ci->upload_buffer);
-        if (fwrite < 0) {
+        int bytes_written = fwrite(conn->f_buf, 1, bytes_received, conn->target_file);
+        printf("Wrote: \n%.*s\n to file", bytes_written, conn->f_buf);
+        if (bytes_written < 0) {
             return -1;
         }
         remaining-=bytes_written;
     }
-    fflush(ci->dest_file);
+    fflush(conn->target_file); // needed?
 
+    conn->bytes_transferred+=bytes_received;
     return bytes_received;
 }
 
 // TODO: Re-examine file permissions
-void setup_storage_dir(char *filename) {
+int setup_storage(char *dirname) {
     struct stat sb;
-    if (stat(filename, &sb) == 0 && S_ISDIR(sb.st_mode))
+    int res = stat(dirname, &sb);
+    
+    if (res < 0) {
+        fprintf(stderr, "stat() error: %s\n", strerror(errno));
+        return -1;
+    }
+    if (S_ISDIR(sb.st_mode))
     {
-        return;
+        // Storage already initialized
+        return 0; 
     }
 
-    if (mkdir("storage", 755) != 0) {
+    // TODO: Handle situation where it already exists
+    if (mkdir("storage", 755) != 0) { // TODO: examine permissions
         fprintf(
             stderr, 
             "Failed creating directory `storage` with permissions (755): %s\n",
             strerror(errno)
         );
-        return;
+        return -1; //error
     } 
+
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
 
-    if (argc < 2) {
-        fprintf(stderr, "usage: filedrop <port_no>\n");
+    if (argc < 3) {
+        //fprintf(stderr, "usage: filedrop <port_no>\n");
+        fprintf(stderr, "Usage: filedrop <bind_port> <storage_dirname>");
         return 1;
     }
+    
+    char *port = argv[1];
+    char *storage_dirname = argv[2];
 
-    SSL_CTX *context;
-    ssl_initialize(&context);
+    SSL_CTX *ssl_ctx;
+    ssl_initialize(&ssl_ctx);
 
     printf("-> Configuring bind address...\n");
     struct addrinfo hints;
@@ -403,7 +488,7 @@ int main(int argc, char *argv[]) {
     hints.ai_flags = AI_PASSIVE;
 
     struct addrinfo *local_address;
-    getaddrinfo(INADDRANY, argv[1], &hints, &local_address);
+    getaddrinfo(INADDRANY, port, &hints, &local_address);
 
     printf("-> Creating socket...\n");
     int server;
@@ -432,79 +517,303 @@ int main(int argc, char *argv[]) {
     }
     printf("-> Server active and listening for connections with a queue limit of %d\n", BACKLOG);
 
-    setup_storage_dir("storage");
+    setup_storage(storage_dirname);
     printf("-> Finished setting up storage folder!\n");
 
-    fd_set master;
-    FD_ZERO(&master);
-    FD_SET(server, &master);
+    fd_set reads_m;
+    FD_ZERO(&reads_m);
+    FD_SET(server, &reads_m);
+
+    fd_set writes_m;
+    FD_ZERO(&writes_m);
     int max_socket = server;
 
     printf("-> Starting loop to accept connections...\n");
     while(1) {
-        fd_set reads = master;
-        printf("-> Server waiting for reads...\n");
-        if (select(max_socket + 1, &reads, 0, 0, 0) < 0) {
+        fd_set reads = reads_m;
+        fd_set writes = writes_m;
+        printf("-> Server: Active and waiting to read or write\n");
+        if (select(max_socket + 1, &reads, &writes, 0, 0) < 0) {
             fprintf(stderr, "select() call failed: %s\n", strerror(errno));
             return 1;
         }
 
         for (int i = 1; i <= max_socket; ++i) {
             if (FD_ISSET(i, &reads)) {
-                printf("Selected socket %d\n", i);
                 if (i == server) {
-                    printf("-> New incoming connection.\n");
-                    struct client_info *new_client = accept_connection((SOCKET) i);
-                    if (!new_client) {
+                    printf("-> Server: New incoming connection.\n");
+                    struct connection *new_conn;
+                    if (accept_connection((SOCKET) i, new_conn) < 0) {
                         fprintf(stderr, "accept_connection() failed\n");
-                        printf("connection failed?\n");
-                        FD_CLR(i, &master);
                         continue; 
                     }
-                    printf("-> New connection made from %s\n", new_client->address_p);
-                    FD_SET(new_client->socket, &reads);
-                    if (new_client->socket > max_socket)
-                    {
-                        max_socket = new_client->socket;
-                    }
-
-                    printf("-> Setting up ssl connection...\n");
-                    // TODO fix: It blocks
-                    try_make_ssl_connection(context, new_client);
-                    if (!new_client->ssl_connection) {
-                        printf("Warning! ssl_connection not made, uploads will default to less safe channels\n");
+                    printf("-> Server: New connection made from %s\n", new_conn->address_p);
+                    FD_SET(new_conn->socket, &reads_m);
+                    FD_SET(new_conn->socket, &writes_m);
+                    if (new_conn->socket > max_socket) max_socket = new_conn->socket;
+                    
+                    if (init_ssl_connection(ssl_ctx, new_conn) > 0) {
+                        printf("-> (%d): Initializing ssl connection attempt for socket\n", new_conn->socket);
+                        new_conn->state = ssl_handshake_in_progress;
                     } else {
-                        printf("ssl connection successful. using %s\n", SSL_get_cipher(new_client->ssl_connection));
+                        printf("-> (%d): Defaulting to non-TLS channel\n", new_conn->socket);
+                        snprintf(
+                            new_conn->next_msg, sizeof(new_conn->next_msg), "%s\n%s",
+                            "Could not establish a TLS connection. Proceeding...",
+                            "Do you want to upload or download a file? (U/u for upload. D/d for download): "
+                        );
+                        new_conn->state = send_action_prompt;
                     }
                 } else {
-                    printf("-> Reading from established connection\n");
-                    struct client_info *client = get_client(i);
-                    int bytes_uploaded = handle_upload(client, argv[2]);
-                    printf("handle___upload() return value: %d\n", bytes_uploaded);
+                    printf("-> Server: Handling existing connection\n");
+                    struct connection *conn = get_connection_info(i);
+                    switch(conn->state) {
+                        case ssl_handshake_in_progress: {
+                            if (handle_ssl_connection(ssl_ctx, conn) < 0) {
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s",
+                                    "Couldn't establish SSL connection. Defaulting to normal connection.\n"
+                                );
+                                conn->state = send_action_prompt;
+                                break;
+                            }
+                            if (SSL_is_init_finished(conn->ssl_conn)) {
+                                if (set_socket_blocking(conn->socket) < 0) {
+                                    snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s",
+                                    "Connection exited: An error occured while initiating the SSL connection.\n"
+                                    );
+                                    conn->state = send_action_prompt;
+                                    break;
+                                }
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s\n%s",
+                                    "TLS connection established successfully",
+                                    "Do you want to upload or download a file? (U/u for upload. D/d for download): "
+                                );
+                                conn->state = send_action_prompt;
+                                break;
+                            } 
+                        }
 
-                    // TODO: Distinguish from error and file upload completion
-                    if (bytes_uploaded < 0) { //TODO: also handle if bytes_uploaded < sizeof(client->upload_buffer)
-                        // (contd:) This would also mean that the read is complete
-                        // TODO: Fix! Not every termination is due to an error.
-                        printf("-> Client %s got an error. Dropping.. \n", client->address_p);
-                        printf("-> Uploaded %d bytes in total\n", client->bytes_uploaded);
-                        drop_client(client); //TODO: no longer being triggered for some reason
-                        FD_CLR(i, &master);
-                    } else { // so we can read again
-                        FD_SET(i, &master);
+                        case receive_action: {
+                            // TODO: Re-evaluate size
+                            char read_buf[10]; 
+                            int bytes_read;
+                            if ((bytes_read = recv_from_client(conn, read_buf, sizeof(read_buf))) <= 0) {
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s", "Connection Error. Exiting...\n"
+                                );
+                                conn->state = error_state;
+                                break;
+                            } else {
+                                // TODO: More robust handling and parsing
+                                char response = tolower(read_buf[0]); 
+                                if (response == 'u') {
+                                    conn->action = upload;
+                                    snprintf(
+                                        conn->next_msg, sizeof(conn->next_msg), "%s",
+                                        "What should your upload be saved as?: "
+                                    );
+                                    conn->state = send_fname_prompt;
+                                    break;
+                                } else if (response == 'd') {
+                                    conn->action = download;
+                                    snprintf(
+                                        conn->next_msg, sizeof(conn->next_msg), "%s",
+                                        "What file do you want to download?: "
+                                    );
+                                    conn->state = send_fname_prompt;
+                                    break;
+                                } else {
+                                    snprintf(
+                                        conn->next_msg, sizeof(conn->next_msg), "%s",
+                                        "Invalid response, Please Enter (U/u)for uploads and (D/d) for downloads: "
+                                    );
+                                    conn->state = send_action_prompt;
+                                    break;
+                                }
+                            }
+                        }
+
+                        case receive_fname: {
+                            char read_buf[ sizeof(conn->f_name)]; 
+                            int bytes_read;
+                            // TODO: Check this
+                            if ((bytes_read = recv_from_client(conn, read_buf, sizeof(read_buf) - 1)) <= 0) { 
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s", "Connection Error. Exiting...\n"
+                                );
+                                conn->state = error_state;
+                                break;
+                            } else {
+                                read_buf[bytes_read] = 0; // TODO: Check this
+                                int file_exists = access(read_buf, F_OK);
+                                if (conn->action == upload) {
+                                    if (file_exists == 0) {
+                                        snprintf(
+                                            conn->next_msg, sizeof(conn->next_msg), "%s",
+                                            "File already exists. Please pick a unique name for your file: "
+                                        );
+                                        conn->state = send_fname_prompt;
+                                        break;
+                                    } else {
+                                        snprintf(
+                                            conn->next_msg, sizeof(conn->next_msg), "%s", "Starting upload.\n"
+                                        );
+                                    }
+                                } else if (conn->action == download) {
+                                    if (file_exists < 0) {
+                                        snprintf(
+                                            conn->next_msg, sizeof(conn->next_msg), "%s",
+                                            "The file you requested doesn't exist.\n"
+                                        );
+                                        conn->state = send_fname_prompt;
+                                        break;
+                                    } else {
+                                        snprintf(
+                                            conn->next_msg, sizeof(conn->next_msg), "%s", "Starting download.\n"
+                                        );
+                                    }
+                                }
+                            }
+                            snprintf(conn->f_name, sizeof(conn->f_name), "%s", read_buf);
+                            conn->state = initiate_action;
+                            break;
+                        }
+
+                        // Send progress during write?
+                        case upload_in_progress: {
+                            int res;
+                            if ((res = handle_upload(conn, storage_dirname)) < 0) {
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s",
+                                    "Error encountered during upload. Dropping connection...\n"
+                                );
+                                conn->state = error_state;
+                            } else if (res == 0) {
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), 
+                                    "Upload of (%s) complete!. Bytes transferred: %d\n",
+                                    conn->f_name, conn->bytes_transferred
+                                );
+                                conn->state = action_success;
+                            } 
+                            break;
+                        }
+
+                        default:
+                            break;
                     }
                 }
-            } 
-        } // End loop to max_socket
-    } // End while(1) loop
+            } else if (FD_ISET(i, &writes)) {
+                printf("(%d) is ready for writing..\n", i);
+                struct connection *conn = get_connection_info(i);
+                switch (conn->state) {
+                    case send_action_prompt: {
+                        if (send_to_client(conn, conn->next_msg, sizeof(conn->next_msg)) < 0) {
+                            sprintf(conn->next_msg, sizeof(conn->next_msg), "Connection Error. Dropping client");
+                            conn->state = error_state;
+                            break;
+                        } 
+                        conn->state = receive_action;
+                        break;
+                    }
+
+                    case ssl_handshake_in_progress: {
+                        if (handle_ssl_connection(ssl_ctx, conn) < 0) {
+                            snprintf(
+                                conn->next_msg, sizeof(conn->next_msg), "%s",
+                                "Couldn't establish SSL connection. Defaulting to normal connection.\n"
+                            );
+                            conn->state = send_action_prompt;
+                            break;
+                        }
+                        if (SSL_is_init_finished(conn->ssl_conn)) {
+                            if (set_socket_blocking(conn->socket) < 0) {
+                                snprintf(
+                                    conn->next_msg, sizeof(conn->next_msg), "%s",
+                                    "Connection exited: An error occured while initiating the SSL connection.\n"
+                                );
+                                conn->state = error_state;
+                                break;
+                            }
+                            snprintf(
+                                conn->next_msg, sizeof(conn->next_msg), "%s\n%s",
+                                "TLS connection established successfully",
+                                "Do you want to upload or download a file? (U/u for upload. D/d for download): "
+                            );
+                            conn->state = send_action_prompt;
+                            break;
+                        }
+                    }
+
+                    case send_fname_prompt: {
+                        if (send_to_client(conn, conn->next_msg, sizeof(conn->next_msg)) <= 0) {
+                            sprintf(conn->next_msg, sizeof(conn->next_msg), "Connection Error. Dropping client");
+                            conn->state = error_state;
+                            break;
+                        }
+
+                        conn->state = receive_fname;
+                        break;
+                    }
+
+                    case initiate_action: {
+                        if (send_to_client(conn, conn->next_msg, sizeof(conn->next_msg)) <= 0) {
+                            sprintf(
+                                conn->next_msg, sizeof(conn->next_msg), 
+                                "Connection Error. Dropping client"
+                            );
+                            conn->state = error_state;
+                            break;
+                        }
+
+                        conn->state = conn->action == upload ? upload_in_progress : download_in_progress;
+
+                        break;
+                    }
+
+                    case download_in_progress: {
+                        int res;
+                        if ((res = handle_download(conn, storage_dirname)) == -1) {
+                            sprintf(
+                                conn->next_msg, sizeof(conn->next_msg), 
+                                "Error while serving download. Dropping client"
+                            );
+                            conn->state = error_state;
+                        } else if (res == 0) {
+                            conn->state = action_success;
+                        } 
+                        break;
+                    }
+
+                    case action_success: {
+                        if (send_to_client(conn, conn->next_msg, strlen(conn->next_msg)) <= 0) {   
+                            conn->state = error_state;
+                            break;
+                        }
+                        drop_connection(conn);
+                        break;
+                    }
+
+                    case error_state: {
+                        send_to_client(conn, conn->next_msg, strlen(conn->next_msg));
+                        drop_connection(conn);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     printf("Shutting down server...\n");
-    struct client_info *client = active_clients;
-    while(client) {
-        struct client_info *next = client->next;
-        drop_client(client);
-        client = next;
+    struct connection *conn = active_connections;
+    while(conn) {
+        struct client_info *next = conn->next;
+        drop_connection(conn);
+        conn = next;
     }
     close(server);
-    SSL_CTX_free(context);
+    SSL_CTX_free(ssl_ctx);
 }
