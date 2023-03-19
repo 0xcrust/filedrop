@@ -1,1 +1,1 @@
-gcc filedrop.c -o filedrop -lssl -lcrypto && ./filedrop $1
+gcc filedrop.c -o filedrop -lssl -lcrypto && ./filedrop $1 $2

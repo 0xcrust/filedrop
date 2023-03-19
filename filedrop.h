@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ctype.h>
 
 // Open SSL dependencies
 #include <openssl/crypto.h>
@@ -26,8 +27,9 @@
 #define SOCKET int
 #define INADDRANY 0
 #define BACKLOG 20
-#define BUFFERSIZE 2048
+#define BUFFERSIZE 56626
 #define NAME_LENGTH 100
+#define F_NAME_LENGTH 100 //TODO:
 
 #define CLIENT_FOUND 1
 #define CLIENT_NOT_FOUND 0
