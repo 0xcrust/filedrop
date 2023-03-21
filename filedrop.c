@@ -44,7 +44,6 @@ struct connection *get_connection_info(SOCKET s);
 int accept_connection(SOCKET server, struct connection **conn_p);
 int set_socket_non_blocking(int sock);
 int init_ssl_connection(SSL_CTX *ssl_context, struct connection* conn);
-int handle_ssl_connection(SSL_CTX *ssl_context, struct connection *conn);
 void drop_connection(struct connection *conn);
 int send_to_client(struct connection *conn, char *buf, int buf_size);
 int receive_from_client(struct connection *conn, char *buf, int buf_size); 
@@ -143,18 +142,24 @@ int main(int argc, char *argv[]) {
                     FD_SET(new_conn->socket, &writes_m);
                     if (new_conn->socket > max_socket) max_socket = new_conn->socket;
                     
-                    if (init_ssl_connection(ssl_ctx, new_conn) >= 0) {
-                        printf("(%d): Initializing ssl connection attempt for socket\n", new_conn->socket);
-                        new_conn->state = ssl_handshake_in_progress;
-                        FD_SET(new_conn->socket, &reads_m);
-                    } else {
+                    if (init_ssl_connection(ssl_ctx, new_conn) < 0) {
                         printf("(%d): Defaulting to non-TLS channel.\n", new_conn->socket);
                         snprintf(
                             new_conn->next_msg, sizeof(new_conn->next_msg),
                             "Could not establish a TLS connection. Proceeding...\nDo you want to upload or download a file? (U/u for upload. D/d for download): "
                         );
-                        new_conn->state = send_action_prompt;
+                        //SSL_shutdown(new_conn->ssl_conn);
+                        //SSL_free(new_conn->ssl_conn);
+                    } else {
+                        printf("(%d): TLS connection successful with cipher %s.\n", new_conn->socket, SSL_get_cipher(new_conn->ssl_conn));
+                        snprintf(
+                            new_conn->next_msg, sizeof(new_conn->next_msg),
+                            "TLS connection successful. Do you want to upload or download a file? (U/u for upload, D/d for download): "
+                        );  
                     }
+                    new_conn->state = send_action_prompt;
+                    FD_SET(new_conn->socket, &writes_m);
+                    
                 } else {   
                     struct connection *conn = get_connection_info(i); 
                     conn->last_active = get_time();
@@ -162,8 +167,7 @@ int main(int argc, char *argv[]) {
                     printf("(%d): Available for read with state (%s)..\n", i, print_state(conn->state));
                     switch(conn->state) {
                         case ssl_handshake_in_progress: {
-                            printf("Is this the problem??\n");
-                            if (handle_ssl_connection(ssl_ctx, conn) < 0) {
+                            if (init_ssl_connection(ssl_ctx, conn) < 0) {
                                 snprintf(
                                     conn->next_msg, sizeof(conn->next_msg), "%s",
                                     "Couldn't establish SSL connection. Defaulting to normal connection.\n"
@@ -174,6 +178,7 @@ int main(int argc, char *argv[]) {
                             }
                             printf("mid_point lol\n");
                             if (SSL_is_init_finished(conn->ssl_conn)) {
+                                printf("(%d): SSL connection successful. using %s\n", conn->socket, SSL_get_cipher(conn->ssl_conn));
                                 snprintf(
                                     conn->next_msg, sizeof(conn->next_msg), "%s\n%s",
                                     "TLS connection established successfully.",
@@ -183,7 +188,9 @@ int main(int argc, char *argv[]) {
                                 conn->state = send_action_prompt;
                                 break;
                             } 
-                            printf("Exiting it now...\n");
+                            FD_CLR(conn->socket, &reads_m);
+                            FD_SET(conn->socket, &writes_m);
+                            break;
                         }
 
                         case receive_action: {
@@ -378,13 +385,13 @@ int main(int argc, char *argv[]) {
                             }
 
                             char path[200];
-                            snprintf(path, sizeof(path), "%s/%s", storage_dirname, conn->f_name);
+                            snprintf(path, sizeof(path), "%s%s", storage_dirname, conn->f_name);
                             if (res == -2) {
                                 snprintf(
                                     conn->next_msg, sizeof(conn->next_msg), "%s",
                                     "Internal Error encountered during upload. Dropping connection..\n"
                                 );
-                                printf("Deleting incomplete upload %s..\n", path);
+                                printf("(%d): Upload failed. Deleting incomplete file (%s) and dropping..\n", conn->socket, path);
                                 unlink(path);
                                 conn->state = fail_state;
                                 FD_CLR(conn->socket, &reads_m);
@@ -394,16 +401,14 @@ int main(int argc, char *argv[]) {
 
                             if(res <= 0) {
                                 FD_CLR(conn->socket, &reads_m);
-                                printf("(%d): Error. Connection dropped.\n", conn->socket);
-                                printf("Deleting incomplete upload %s..\n", path);
+                                printf("(%d): Upload failed. Deleting incomplete file (%s) and dropping..\n", conn->socket, path);
                                 unlink(path);
                                 drop_connection(conn);
                             }
-
                             break;
                         }
 
-                        default:
+                        default: 
                             break;
                     }
                 }
@@ -419,6 +424,7 @@ int main(int argc, char *argv[]) {
                             drop_connection(conn);
                             break;
                         } 
+                        printf("sent action prompt?\n");
                         conn->state = receive_action;
                         FD_CLR(conn->socket, &writes_m);
                         FD_SET(conn->socket, &reads_m);
@@ -427,28 +433,30 @@ int main(int argc, char *argv[]) {
 
                     case ssl_handshake_in_progress: {
                         memset(conn->next_msg, 0, sizeof(conn->next_msg));
-                        printf("Here we come again lol...\n");
-                        if (handle_ssl_connection(ssl_ctx, conn) < 0) {
+                        if (init_ssl_connection(ssl_ctx, conn) < 0) {
+                            printf("Error during ssl connection\n");
                             snprintf(
                                 conn->next_msg, sizeof(conn->next_msg), "%s",
                                 "Couldn't establish SSL connection. Defaulting to normal connection.\n"
                             );
                             conn->state = send_action_prompt;
-                            FD_CLR(conn->socket, &reads_m);
                             break;
                         }
-                        printf("Here we midt again...\n");
+
                         if (SSL_is_init_finished(conn->ssl_conn)) {
+                            printf("(%d): SSL connection successful. using %s\n", conn->socket, SSL_get_cipher(conn->ssl_conn));
                             snprintf(
                                 conn->next_msg, sizeof(conn->next_msg), "%s\n%s",
                                 "TLS connection established successfully.",
                                 "Do you want to upload or download a file? (U/u for upload. D/d for download): "
                             );
                             conn->state = send_action_prompt;
-                            FD_CLR(conn->socket, &reads_m);
                             break;
                         }
-                        printf("Here we go again...\n");
+
+                        FD_CLR(conn->socket, &writes_m);
+                        FD_SET(conn->socket, &reads_m);
+                        break;
                     }
 
                     case send_fname_prompt: {
@@ -682,7 +690,7 @@ int set_socket_non_blocking(int sock) {
     return 0;
 }
 
-int init_ssl_connection(SSL_CTX *ssl_context, struct connection* conn) {
+int init_ssl_connection(SSL_CTX *ssl_context, struct connection *conn) {
     SSL *ssl_conn = SSL_new(ssl_context);
 
     if (!ssl_conn) {
@@ -691,54 +699,65 @@ int init_ssl_connection(SSL_CTX *ssl_context, struct connection* conn) {
     }
 
     SSL_set_fd(ssl_conn, conn->socket);
-    return 0;
-}
-
-int handle_ssl_connection(SSL_CTX *ssl_context, struct connection *conn) {
-    printf("Here to find the segfault....\n");
-    int result = SSL_accept(conn->ssl_conn);
-    printf("Do not tell me it is here?");
+    conn->ssl_conn = ssl_conn;
 
     fd_set writes;
     fd_set reads;
 
-    struct timeval timeout;
-    timeout.tv_sec = 1;
-    timeout.tv_usec = 00; // TODO: CHECKME
-
     int status = -1;
-    while(1) {
-        printf("Looping and looking for the segfault ffs. help me!\n");
+
+    struct timeval timeout;
+
+    printf("SSL is init finished begin: %d\n", SSL_is_init_finished(conn->ssl_conn));
+    do {
         FD_ZERO(&writes);
         FD_ZERO(&reads);
-        
-        switch(SSL_get_error(conn->ssl_conn, result)) {
+
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0; 
+
+        status = SSL_accept(conn->ssl_conn);
+
+        switch(SSL_get_error(conn->ssl_conn, status)) {
             case SSL_ERROR_NONE:
                 status = 0;
+                printf("ssl_error_none\n");
                 break;
             case SSL_ERROR_WANT_WRITE:
                 status = 1;
                 FD_SET(conn->socket, &writes);
+                printf("ssl_error_want_write\n");
                 break;
             case SSL_ERROR_WANT_READ:
                 status = 1;
                 FD_SET(conn->socket, &reads);
+                printf("ssl_error_want_read\n");
                 break;
             default:
+                printf("default");
                 status = -1;
                 break;
         }
-        printf("Loop quit. Still looking for it\n");
 
-        if (status < 1) break;
+        printf("status before: %d\n", status);
 
-        if (select(conn->socket + 1, &reads, &writes, 0, &timeout) < 0) {
-            fprintf(stderr, "handle_ssl_connection: Select() failed\n");
-            status = -1;
-            break;
+        if (status == 1) {
+            if (select(conn->socket + 1, &reads, &writes, 0, &timeout) >= 1) { 
+                printf("select > 1\n");
+                status = 1;
+            } else {
+                printf("select < 1\n");
+                fprintf(stderr, "(%d): Handle_ssl_connection: Select() failed\n", conn->socket);
+                status = -1;
+            }
         }
-    }
 
+    } while(!SSL_is_init_finished(conn->ssl_conn) && status == 1);
+
+    printf("SSL is init finished: %d\n", SSL_is_init_finished(conn->ssl_conn));
+    printf("Broke out of loop\n");
+
+    printf("return status: %d\n", status);
     return status;
 }
 
