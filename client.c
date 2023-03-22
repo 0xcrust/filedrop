@@ -32,7 +32,6 @@ int write_to_server(struct connection *conn, char *buf, int buf_size);
 int upload_file_to_server(struct connection *conn, int *total_bytes_uploaded);
 int download_file_from_server(struct connection *conn, int *total_bytes_downloaded);
 
-// TODO: Add comprehensive display logic
 int main(int argc, char *argv[])
 {
     if (argc < 7)
@@ -53,9 +52,10 @@ int main(int argc, char *argv[])
 
     if (strcmp(use_ssl_input, "true") == 0 || strcmp(use_ssl_input, "yes") == 0)
         connection_type = use_ssl;
-    else if(strcmp(use_ssl_input, "false") == 0 || strcmp(use_ssl_input, "no") == 0)
+    else if (strcmp(use_ssl_input, "false") == 0 || strcmp(use_ssl_input, "no") == 0)
         connection_type = normal;
-    else  {
+    else
+    {
         fprintf(stderr, "Invalid use_ssl_input. Exiting..");
         exit(1);
     }
@@ -70,15 +70,17 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    int access_r = access(filepath,F_OK);
+    int access_r = access(filepath, F_OK);
 
-    if (action == upload && access_r != 0) {
+    if (action == upload && access_r != 0)
+    {
         fprintf(stderr, "Filepath %s does not exist\n", filepath);
         exit(1);
-    } 
+    }
 
-    if (action == download && access_r == 0) {
-        fprintf(stderr, "Can't overwrite existing file %s\n", filepath);
+    if (action == download && access_r == 0)
+    {
+        fprintf(stderr, "%s already exists.\n", filepath);
         exit(1);
     }
 
@@ -245,7 +247,7 @@ int main(int argc, char *argv[])
     else if (action == download)
     {
         printf("Start download from server...\n");
-        if (download_file_from_server(conn, &total_bytes) < 0) 
+        if (download_file_from_server(conn, &total_bytes) < 0)
         {
             printf("** Something went wrong during download.\n");
         }
@@ -343,7 +345,8 @@ int download_file_from_server(struct connection *conn, int *total_bytes_download
         while (bytes_written < bytes_read)
         {
             int bytes = fwrite(conn->file_buffer + bytes_written, 1, bytes_read - bytes_written, conn->target_file);
-            if (bytes <= 0) return -1;
+            if (bytes <= 0)
+                return -1;
             bytes_written += bytes;
             *total_bytes_downloaded += bytes;
         }
@@ -351,4 +354,3 @@ int download_file_from_server(struct connection *conn, int *total_bytes_download
 
     return 0;
 }
-
