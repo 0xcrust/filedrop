@@ -9,7 +9,6 @@ Features:
     * Supports SSL connections.
 */
 
-// TODO: Find out why ssl connections may break
 struct connection
 {
     int state;
@@ -575,7 +574,6 @@ int main(int argc, char *argv[])
 
         // Do a health check and drop faulty connections
         int duration = (5 * 60);
-        // int duration = 20;
         long current_time = get_time();
 
         if ((current_time - last_check) > duration)
